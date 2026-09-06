@@ -1,0 +1,13 @@
+name: Test CI
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Print message
+        run: echo "🚀 GitHub Actions funciona correctamente en PuntoCroma"
