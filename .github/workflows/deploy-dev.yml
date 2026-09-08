@@ -1,0 +1,103 @@
+name: Template Deploy to Development
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deploy-development
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: development
+
+    steps:
+      - name: Resolve dev to an immutable SHA
+        id: target
+        env:
+          TARGET_BRANCH: dev
+          REPOSITORY_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
+        run: |
+          set -euo pipefail
+
+          TARGET_REF="refs/heads/$TARGET_BRANCH"
+
+          BASE_SHA="$(
+            git ls-remote --exit-code --heads "$REPOSITORY_URL" "$TARGET_REF" |
+            awk -v ref="$TARGET_REF" '$2 == ref { print $1 }'
+          )"
+
+          if [ -z "$BASE_SHA" ]; then
+            echo "Branch '$TARGET_BRANCH' does not exist."
+            exit 1
+          fi
+
+          echo "branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "ref=$TARGET_REF" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+
+          echo "Development will deploy commit: $BASE_SHA"
+
+      - name: Checkout exactly the validated commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.base_sha }}
+          fetch-depth: 1
+
+      - name: Deploy one VM to development
+        env:
+          RELEASE_SHA: ${{ steps.target.outputs.base_sha }}
+          DEPLOY_ENVIRONMENT: development
+        run: |
+          set -euo pipefail
+
+          # Reemplazar por mecanismo real:
+          # gcloud compute ssh ...
+          # ssh ...
+          # docker compose pull && docker compose up -d ...
+          ./scripts/deploy.sh "$DEPLOY_ENVIRONMENT" "$RELEASE_SHA"
+
+      - name: Record successful development deployment
+        id: record
+        env:
+          RELEASE_SHA: ${{ steps.target.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+
+          DEPLOYED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          mkdir -p .deployments
+          {
+            echo "environment=development"
+            echo "commit=$RELEASE_SHA"
+            echo "deployed_at=$DEPLOYED_AT"
+            echo "run_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > .deployments/development-last-deploy.txt
+
+          echo "deployed_at=$DEPLOYED_AT" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and safely update dev
+        env:
+          TARGET_REF: ${{ steps.target.outputs.ref }}
+          BASE_SHA: ${{ steps.target.outputs.base_sha }}
+          DEPLOYED_AT: ${{ steps.record.outputs.deployed_at }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .deployments/development-last-deploy.txt
+          git commit -m "ci: record development deployment at $DEPLOYED_AT"
+
+          # Garantiza que el commit creado se basa en el SHA desplegado.
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+
+          # Sólo actualiza dev si sigue apuntando al SHA validado al inicio.
+          git push \
+            --force-with-lease="$TARGET_REF:$BASE_SHA" \
+            origin "HEAD:$TARGET_REF"

@@ -1,0 +1,138 @@
+name: Template Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semantic version, e.g. 1.2.3 or v1.2.3"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Validate release version
+        id: version
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$VERSION_INPUT" =~ ^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$ ]]; then
+            echo "Invalid semantic version: '$VERSION_INPUT'"
+            exit 1
+          fi
+
+          echo "value=$VERSION_INPUT" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve main to an immutable SHA
+        id: target
+        env:
+          TARGET_BRANCH: main
+          REPOSITORY_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
+        run: |
+          set -euo pipefail
+
+          TARGET_REF="refs/heads/$TARGET_BRANCH"
+
+          BASE_SHA="$(
+            git ls-remote --exit-code --heads "$REPOSITORY_URL" "$TARGET_REF" |
+            awk -v ref="$TARGET_REF" '$2 == ref { print $1 }'
+          )"
+
+          if [ -z "$BASE_SHA" ]; then
+            echo "Branch '$TARGET_BRANCH' does not exist."
+            exit 1
+          fi
+
+          echo "branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "ref=$TARGET_REF" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+
+          echo "Production will deploy commit: $BASE_SHA"
+
+      - name: Checkout exactly the validated commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.base_sha }}
+          fetch-depth: 1
+
+      - name: Deploy one VM to production
+        env:
+          RELEASE_SHA: ${{ steps.target.outputs.base_sha }}
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+          DEPLOY_ENVIRONMENT: production
+        run: |
+          set -euo pipefail
+
+          # Reemplazar por mecanismo real:l:
+          ./scripts/deploy.sh "$DEPLOY_ENVIRONMENT" "$RELEASE_SHA" "$RELEASE_VERSION"
+
+      - name: Record successful production deployment
+        id: record
+        env:
+          RELEASE_SHA: ${{ steps.target.outputs.base_sha }}
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+
+          DEPLOYED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          mkdir -p .deployments
+          {
+            echo "environment=production"
+            echo "version=$RELEASE_VERSION"
+            echo "commit=$RELEASE_SHA"
+            echo "deployed_at=$DEPLOYED_AT"
+            echo "run_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > .deployments/production-last-deploy.txt
+
+          echo "deployed_at=$DEPLOYED_AT" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and safely update main
+        env:
+          TARGET_REF: ${{ steps.target.outputs.ref }}
+          BASE_SHA: ${{ steps.target.outputs.base_sha }}
+          DEPLOYED_AT: ${{ steps.record.outputs.deployed_at }}
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .deployments/production-last-deploy.txt
+          git commit -m "ci: record production deployment $RELEASE_VERSION at $DEPLOYED_AT"
+
+          # El registro se construyó sobre el commit exacto desplegado.
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+
+          # Falla sin sobrescribir si main cambió durante el deploy.
+          git push \
+            --force-with-lease="$TARGET_REF:$BASE_SHA" \
+            origin "HEAD:$TARGET_REF"
+
+      - name: Create production release tag
+        env:
+          RELEASE_SHA: ${{ steps.target.outputs.base_sha }}
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+
+          TAG="release-$RELEASE_VERSION"
+
+          # El tag apunta al commit desplegado, no al commit de metadata posterior.
+          git tag -a "$TAG" "$RELEASE_SHA" \
+            -m "Production release $RELEASE_VERSION"
+
+          git push origin "refs/tags/$TAG"
