@@ -132,13 +132,22 @@ Reglas obligatorias para cambios de código:
      \`\`\`
   3. Si no hay nada que cambiar o todo está impecable, no inventes diffs innecesarios."
 
-            USER_INPUT="--- REVISIÓN ANTERIOR QUE DEBES EVALUAR: ---
-$PREV_CONTENT
-
---- DIFF ACTUAL DEL PULL REQUEST: ---
-\`\`\`diff
-$DIFF_CONTENT
-\`\`\`"
+            echo "Generando payload seguro con jq --rawfile..."
+            jq -n \
+              --arg prompt "$PROMPT_SYSTEM" \
+              --rawfile prev previous_review.txt \
+              --rawfile diff pr_diff.txt \
+              '{
+                contents: [{
+                  parts: [{
+                    text: ($prompt + "\n\n--- REVISIÓN ANTERIOR QUE DEBES EVALUAR: ---\n" + $prev + "\n\n--- DIFF ACTUAL DEL PULL REQUEST: ---\n```diff\n" + $diff + "\n```")
+                  }]
+                }],
+                generationConfig: {
+                  temperature: 0.2,
+                  maxOutputTokens: 2500
+                }
+              }' > gemini_request.json
           else
             echo "Configurando prompt de revisión inicial..."
             PROMPT_SYSTEM="Eres un Senior Code Reviewer de élite en el equipo de PuntoCroma.
@@ -161,27 +170,22 @@ Reglas importantes y obligatorias de código:
      \`\`\`
 - Si el PR está impecable y listo para mergear, felicita brevemente al autor y confirma que no hay observaciones bloqueantes."
 
-            USER_INPUT="Diff a revisar:
-\`\`\`diff
-$DIFF_CONTENT
-\`\`\`"
+            echo "Generando payload seguro con jq --rawfile..."
+            jq -n \
+              --arg prompt "$PROMPT_SYSTEM" \
+              --rawfile diff pr_diff.txt \
+              '{
+                contents: [{
+                  parts: [{
+                    text: ($prompt + "\n\nDiff a revisar:\n```diff\n" + $diff + "\n```")
+                  }]
+                }],
+                generationConfig: {
+                  temperature: 0.2,
+                  maxOutputTokens: 2500
+                }
+              }' > gemini_request.json
           fi
-
-          echo "Generando payload seguro para la API..."
-          jq -n \
-            --arg prompt "$PROMPT_SYSTEM" \
-            --arg input "$USER_INPUT" \
-            '{
-              contents: [{
-                parts: [{
-                  text: ($prompt + "\n\n" + $input)
-                }]
-              }],
-              generationConfig: {
-                temperature: 0.2,
-                maxOutputTokens: 2500
-              }
-            }' > gemini_request.json
 
           MAX_RETRIES=2
           RETRY_COUNT=0
