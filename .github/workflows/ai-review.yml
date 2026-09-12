@@ -6,7 +6,7 @@ on:
       model:
         description: 'Modelo de Gemini en Google AI Studio'
         type: string
-        default: 'gemini-2.5-flash'
+        default: 'gemini-3.8-flash'
       max_chars:
         description: 'Límite máximo de caracteres en el diff para prevenir sobrepasar cuota'
         type: number
