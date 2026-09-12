@@ -73,35 +73,90 @@ jobs:
           # Guardar diff en archivo temporal para evitar problemas de escape en bash
           printf "%s" "$DIFF" > pr_diff.txt
 
+      - name: Obtener revisión anterior del bot (Contexto)
+        if: steps.get_diff.outputs.has_diff == 'true'
+        id: get_previous_review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Buscando revisiones anteriores del bot en este PR..."
+          PREV_REVIEW=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            --jq '[.[] | select(.body | contains("🤖 PuntoCroma AI Code Review")) | .body] | last // empty' 2>/dev/null || true)
+
+          if [ -n "$PREV_REVIEW" ]; then
+            echo "has_previous_review=true" >> $GITHUB_OUTPUT
+            echo "Revisión anterior detectada. Guardando contexto para seguimiento..."
+            # Limitamos la revisión previa a máx 10.000 caracteres para cuidar tokens
+            printf "%s" "$PREV_REVIEW" | head -c 10000 > previous_review.txt
+          else
+            echo "has_previous_review=false" >> $GITHUB_OUTPUT
+            echo "No se encontraron revisiones previas del bot en este PR."
+          fi
+
       - name: Consultar Gemini con reintento automático por TPM (Rate Limit)
         if: steps.get_diff.outputs.has_diff == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           MODEL: ${{ inputs.model }}
+          HAS_PREV: ${{ steps.get_previous_review.outputs.has_previous_review }}
         run: |
           DIFF_CONTENT=$(cat pr_diff.txt)
 
-          PROMPT_SYSTEM="Eres un Senior Code Reviewer de élite en el equipo de PuntoCroma.
-          Tu tarea es analizar el siguiente git diff de un Pull Request de forma constructiva, profesional, directa y concisa en español (formato Markdown).
+          if [ "$HAS_PREV" = "true" ]; then
+            echo "Configurando prompt de seguimiento (Re-evaluación con contexto previo)..."
+            PREV_CONTENT=$(cat previous_review.txt)
 
-          Estructura tu revisión en las siguientes secciones:
-          1. 📋 **Resumen de cambios**: Explica brevemente qué resuelve o implementa este PR.
-          2. 💡 **Aspectos destacados**: Buenas prácticas o soluciones limpias detectadas en el código.
-          3. ⚠️ **Riesgos y Bugs potenciales**: Edge cases no cubiertos, problemas de rendimiento, manejo de errores o seguridad.
-          4. 🔧 **Sugerencias de mejora**: Consejos opcionales para mejorar legibilidad o mantenimiento.
+            PROMPT_SYSTEM="Eres un Senior Code Reviewer de élite en el equipo de PuntoCroma.
+Esta es una REVISIÓN DE SEGUIMIENTO (re-evaluación) para un Pull Request que ya habías revisado previamente.
 
-          Reglas importantes:
-          - No seas excesivamente pedante en detalles de formato si el código es claro.
-          - Si el PR está impecable y listo para mergear, felicita brevemente al autor y confirma que no hay observaciones bloqueantes."
+Tu objetivo principal es:
+1. Evaluar si los problemas, riesgos, bugs o sugerencias señalados en tu REVISIÓN ANTERIOR fueron corregidos o abordados adecuadamente en los cambios actuales.
+2. Revisar si los nuevos cambios introducen algún nuevo problema, edge case, riesgo de seguridad o de rendimiento.
+3. Si todo lo observado anteriormente fue resuelto con éxito y no hay nuevos problemas, felicitar al autor y dar tu visto bueno para mergear.
+
+Estructura tu respuesta en las siguientes secciones (Markdown):
+1. 🔄 **Seguimiento de observaciones anteriores**: Detalla puntualmente el estado de cada sugerencia/riesgo previo (ej. ✅ Corregido, ⏳ Pendiente, o ℹ️ No aplica).
+2. 📋 **Resumen de los nuevos cambios**: Breve descripción de los ajustes realizados desde la última revisión.
+3. ⚠️ **Nuevos riesgos o bugs detectados**: (si los hay; si no, indícalo explícitamente).
+4. 🔧 **Sugerencias de mejora adicionales**: (opcionales).
+5. 🏁 **Veredicto y Conclusión**: Dictamen claro sobre si el PR está listo para ser aprobado y mergeado."
+
+            USER_INPUT="--- REVISIÓN ANTERIOR QUE DEBES EVALUAR: ---
+$PREV_CONTENT
+
+--- DIFF ACTUAL DEL PULL REQUEST: ---
+\`\`\`diff
+$DIFF_CONTENT
+\`\`\`"
+          else
+            echo "Configurando prompt de revisión inicial..."
+            PROMPT_SYSTEM="Eres un Senior Code Reviewer de élite en el equipo de PuntoCroma.
+Tu tarea es analizar el siguiente git diff de un Pull Request de forma constructiva, profesional, directa y concisa en español (formato Markdown).
+
+Estructura tu revisión en las siguientes secciones:
+1. 📋 **Resumen de cambios**: Explica brevemente qué resuelve o implementa este PR.
+2. 💡 **Aspectos destacados**: Buenas prácticas o soluciones limpias detectadas en el código.
+3. ⚠️ **Riesgos y Bugs potenciales**: Edge cases no cubiertos, problemas de rendimiento, manejo de errores o seguridad.
+4. 🔧 **Sugerencias de mejora**: Consejos opcionales para mejorar legibilidad o mantenimiento.
+
+Reglas importantes:
+- No seas excesivamente pedante en detalles de formato si el código es claro.
+- Si el PR está impecable y listo para mergear, felicita brevemente al autor y confirma que no hay observaciones bloqueantes."
+
+            USER_INPUT="Diff a revisar:
+\`\`\`diff
+$DIFF_CONTENT
+\`\`\`"
+          fi
 
           echo "Generando payload seguro para la API..."
           jq -n \
             --arg prompt "$PROMPT_SYSTEM" \
-            --arg diff "$DIFF_CONTENT" \
+            --arg input "$USER_INPUT" \
             '{
               contents: [{
                 parts: [{
-                  text: ($prompt + "\n\nDiff a revisar:\n```diff\n" + $diff + "\n```")
+                  text: ($prompt + "\n\n" + $input)
                 }]
               }],
               generationConfig: {
@@ -157,9 +212,15 @@ jobs:
             exit 1
           fi
 
+          # Encabezado dinámico según si es primera revisión o re-evaluación
+          TITLE="## 🤖 PuntoCroma AI Code Review"
+          if [ "$HAS_PREV" = "true" ]; then
+            TITLE="## 🤖 PuntoCroma AI Code Review (Re-evaluación)"
+          fi
+
           # Generar archivo final de comentario Markdown
           {
-            echo "## 🤖 PuntoCroma AI Code Review"
+            echo "$TITLE"
             echo ""
             echo "$REVIEW_TEXT"
             echo ""
