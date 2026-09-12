@@ -119,7 +119,18 @@ Estructura tu respuesta en las siguientes secciones (Markdown):
 2. 📋 **Resumen de los nuevos cambios**: Breve descripción de los ajustes realizados desde la última revisión.
 3. ⚠️ **Nuevos riesgos o bugs detectados**: (si los hay; si no, indícalo explícitamente).
 4. 🔧 **Sugerencias de mejora adicionales**: (opcionales).
-5. 🏁 **Veredicto y Conclusión**: Dictamen claro sobre si el PR está listo para ser aprobado y mergeado."
+5. 🏁 **Veredicto y Conclusión**: Dictamen claro sobre si el PR está listo para ser aprobado y mergeado.
+
+Reglas obligatorias para cambios de código:
+- Para cualquier riesgo, bug o mejora técnica que detectes, debes ser quirúrgico:
+  1. Indica el archivo exacto.
+  2. Muestra el cambio exacto usando un bloque en \`\`\`diff con sintaxis de Git, marcando con '-' la línea a quitar/modificar y con '+' la solución propuesta lista para copiar y pegar:
+     \`\`\`diff
+     // ruta/al/archivo.ts
+     - codigoProblematico();
+     + codigoCorregidoYSeguro();
+     \`\`\`
+  3. Si no hay nada que cambiar o todo está impecable, no inventes diffs innecesarios."
 
             USER_INPUT="--- REVISIÓN ANTERIOR QUE DEBES EVALUAR: ---
 $PREV_CONTENT
@@ -139,8 +150,15 @@ Estructura tu revisión en las siguientes secciones:
 3. ⚠️ **Riesgos y Bugs potenciales**: Edge cases no cubiertos, problemas de rendimiento, manejo de errores o seguridad.
 4. 🔧 **Sugerencias de mejora**: Consejos opcionales para mejorar legibilidad o mantenimiento.
 
-Reglas importantes:
-- No seas excesivamente pedante en detalles de formato si el código es claro.
+Reglas importantes y obligatorias de código:
+- Para cada riesgo, bug o sugerencia técnica que menciones, incluye siempre:
+  1. El nombre del archivo exacto.
+  2. Un bloque de código en formato \`\`\`diff coloreado (usando '-' para lo que se debe cambiar/eliminar y '+' para la alternativa recomendada lista para copiar y pegar):
+     \`\`\`diff
+     // ruta/al/archivo.ext
+     - lineaActualConProblema();
+     + lineaPropuestaMejorada();
+     \`\`\`
 - Si el PR está impecable y listo para mergear, felicita brevemente al autor y confirma que no hay observaciones bloqueantes."
 
             USER_INPUT="Diff a revisar:
