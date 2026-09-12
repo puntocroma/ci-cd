@@ -1,0 +1,256 @@
+name: AI PR Reviewer
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: 'Modelo de Gemini en Google AI Studio'
+        type: string
+        default: 'gemini-3.8-flash'
+      max_chars:
+        description: 'Límite máximo de caracteres en el diff para prevenir sobrepasar cuota'
+        type: number
+        default: 800000
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+
+jobs:
+  review:
+    name: Gemini AI Review
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extraer y filtrar Diff del PR
+        id: get_diff
+        env:
+          MAX_CHARS: ${{ inputs.max_chars }}
+        run: |
+          echo "Obteniendo diff contra origin/${{ github.base_ref }} excluyendo archivos generados y binarios..."
+          
+          DIFF=$(git diff "origin/${{ github.base_ref }}...HEAD" \
+            -- . \
+            ':(exclude)*.lock' \
+            ':(exclude)*package-lock.json' \
+            ':(exclude)*pnpm-lock.yaml' \
+            ':(exclude)*bun.lock' \
+            ':(exclude)*bun.lockb' \
+            ':(exclude)*dist/**' \
+            ':(exclude)*build/**' \
+            ':(exclude)*.min.js' \
+            ':(exclude)*.svg' \
+            ':(exclude)*.png' \
+            ':(exclude)*.jpg' \
+            ':(exclude)*.jpeg' \
+            ':(exclude)*.ico')
+
+          DIFF_SIZE=${#DIFF}
+          echo "Tamaño del diff filtrado: $DIFF_SIZE caracteres"
+
+          if [ "$DIFF_SIZE" -eq 0 ]; then
+            echo "has_diff=false" >> $GITHUB_OUTPUT
+            echo "El PR no contiene cambios de código analizables (solo lockfiles o assets)."
+            exit 0
+          fi
+
+          echo "has_diff=true" >> $GITHUB_OUTPUT
+
+          # Control de cuota: truncado seguro si supera el umbral configurado
+          if [ "$DIFF_SIZE" -gt "$MAX_CHARS" ]; then
+            echo "⚠️ El diff superó el límite de seguridad ($DIFF_SIZE > $MAX_CHARS chars). Truncando..."
+            DIFF=$(echo "$DIFF" | head -c "$MAX_CHARS")
+            DIFF+=$'\n\n[... DIFF TRUNCADO POR TAMAÑO MÁXIMO: El cambio superó el umbral configurado para proteger el rate limit ...]'
+          fi
+
+          # Guardar diff en archivo temporal para evitar problemas de escape en bash
+          printf "%s" "$DIFF" > pr_diff.txt
+
+      - name: Obtener revisión anterior del bot (Contexto)
+        if: steps.get_diff.outputs.has_diff == 'true'
+        id: get_previous_review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Buscando revisiones anteriores del bot en este PR..."
+          PREV_REVIEW=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            --jq '[.[] | select(.body | contains("🤖 PuntoCroma AI Code Review")) | .body] | last // empty' 2>/dev/null || true)
+
+          if [ -n "$PREV_REVIEW" ]; then
+            echo "has_previous_review=true" >> $GITHUB_OUTPUT
+            echo "Revisión anterior detectada. Guardando contexto para seguimiento..."
+            # Limitamos la revisión previa a máx 10.000 caracteres para cuidar tokens
+            printf "%s" "$PREV_REVIEW" | head -c 10000 > previous_review.txt
+          else
+            echo "has_previous_review=false" >> $GITHUB_OUTPUT
+            echo "No se encontraron revisiones previas del bot en este PR."
+          fi
+
+      - name: Consultar Gemini con reintento automático por TPM (Rate Limit)
+        if: steps.get_diff.outputs.has_diff == 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MODEL: ${{ inputs.model }}
+          HAS_PREV: ${{ steps.get_previous_review.outputs.has_previous_review }}
+        run: |
+          DIFF_CONTENT=$(cat pr_diff.txt)
+
+          if [ "$HAS_PREV" = "true" ]; then
+            echo "Configurando prompt de seguimiento (Re-evaluación con contexto previo)..."
+            PREV_CONTENT=$(cat previous_review.txt)
+
+            PROMPT_SYSTEM="Eres un Senior Code Reviewer de élite en el equipo de PuntoCroma.
+Esta es una REVISIÓN DE SEGUIMIENTO (re-evaluación) para un Pull Request que ya habías revisado previamente.
+
+Tu objetivo principal es:
+1. Evaluar si los problemas, riesgos, bugs o sugerencias señalados en tu REVISIÓN ANTERIOR fueron corregidos o abordados adecuadamente en los cambios actuales.
+2. Revisar si los nuevos cambios introducen algún nuevo problema, edge case, riesgo de seguridad o de rendimiento.
+3. Si todo lo observado anteriormente fue resuelto con éxito y no hay nuevos problemas, felicitar al autor y dar tu visto bueno para mergear.
+
+Estructura tu respuesta en las siguientes secciones (Markdown):
+1. 🔄 **Seguimiento de observaciones anteriores**: Detalla puntualmente el estado de cada sugerencia/riesgo previo (ej. ✅ Corregido, ⏳ Pendiente, o ℹ️ No aplica).
+2. 📋 **Resumen de los nuevos cambios**: Breve descripción de los ajustes realizados desde la última revisión.
+3. ⚠️ **Nuevos riesgos o bugs detectados**: (si los hay; si no, indícalo explícitamente).
+4. 🔧 **Sugerencias de mejora adicionales**: (opcionales).
+5. 🏁 **Veredicto y Conclusión**: Dictamen claro sobre si el PR está listo para ser aprobado y mergeado.
+
+Reglas obligatorias para cambios de código:
+- Para cualquier riesgo, bug o mejora técnica que detectes, debes ser quirúrgico:
+  1. Indica el archivo exacto.
+  2. Muestra el cambio exacto usando un bloque en \`\`\`diff con sintaxis de Git, marcando con '-' la línea a quitar/modificar y con '+' la solución propuesta lista para copiar y pegar:
+     \`\`\`diff
+     // ruta/al/archivo.ts
+     - codigoProblematico();
+     + codigoCorregidoYSeguro();
+     \`\`\`
+  3. Si no hay nada que cambiar o todo está impecable, no inventes diffs innecesarios."
+
+            USER_INPUT="--- REVISIÓN ANTERIOR QUE DEBES EVALUAR: ---
+$PREV_CONTENT
+
+--- DIFF ACTUAL DEL PULL REQUEST: ---
+\`\`\`diff
+$DIFF_CONTENT
+\`\`\`"
+          else
+            echo "Configurando prompt de revisión inicial..."
+            PROMPT_SYSTEM="Eres un Senior Code Reviewer de élite en el equipo de PuntoCroma.
+Tu tarea es analizar el siguiente git diff de un Pull Request de forma constructiva, profesional, directa y concisa en español (formato Markdown).
+
+Estructura tu revisión en las siguientes secciones:
+1. 📋 **Resumen de cambios**: Explica brevemente qué resuelve o implementa este PR.
+2. 💡 **Aspectos destacados**: Buenas prácticas o soluciones limpias detectadas en el código.
+3. ⚠️ **Riesgos y Bugs potenciales**: Edge cases no cubiertos, problemas de rendimiento, manejo de errores o seguridad.
+4. 🔧 **Sugerencias de mejora**: Consejos opcionales para mejorar legibilidad o mantenimiento.
+
+Reglas importantes y obligatorias de código:
+- Para cada riesgo, bug o sugerencia técnica que menciones, incluye siempre:
+  1. El nombre del archivo exacto.
+  2. Un bloque de código en formato \`\`\`diff coloreado (usando '-' para lo que se debe cambiar/eliminar y '+' para la alternativa recomendada lista para copiar y pegar):
+     \`\`\`diff
+     // ruta/al/archivo.ext
+     - lineaActualConProblema();
+     + lineaPropuestaMejorada();
+     \`\`\`
+- Si el PR está impecable y listo para mergear, felicita brevemente al autor y confirma que no hay observaciones bloqueantes."
+
+            USER_INPUT="Diff a revisar:
+\`\`\`diff
+$DIFF_CONTENT
+\`\`\`"
+          fi
+
+          echo "Generando payload seguro para la API..."
+          jq -n \
+            --arg prompt "$PROMPT_SYSTEM" \
+            --arg input "$USER_INPUT" \
+            '{
+              contents: [{
+                parts: [{
+                  text: ($prompt + "\n\n" + $input)
+                }]
+              }],
+              generationConfig: {
+                temperature: 0.2,
+                maxOutputTokens: 2500
+              }
+            }' > gemini_request.json
+
+          MAX_RETRIES=2
+          RETRY_COUNT=0
+          SUCCESS=false
+
+          while [ $RETRY_COUNT -le $MAX_RETRIES ]; do
+            echo "Enviando diff a Google AI Studio ($MODEL) - Intento $((RETRY_COUNT + 1))..."
+
+            HTTP_STATUS=$(curl -s -o gemini_response.json -w "%{http_code}" -X POST \
+              "https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${GEMINI_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d @gemini_request.json)
+
+            if [ "$HTTP_STATUS" -eq 200 ]; then
+              SUCCESS=true
+              echo "✅ Respuesta recibida exitosamente de Gemini."
+              break
+            elif [ "$HTTP_STATUS" -eq 429 ]; then
+              echo "⚠️ HTTP 429: Límite de tasa (TPM o RPM) alcanzado."
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "⏳ Esperando 60 segundos para reiniciar la ventana de tokens antes de reintentar..."
+                sleep 60
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+              else
+                echo "❌ Se agotaron los reintentos tras error 429."
+                break
+              fi
+            else
+              echo "❌ Error HTTP $HTTP_STATUS al conectar con la API de Gemini."
+              cat gemini_response.json
+              break
+            fi
+          done
+
+          if [ "$SUCCESS" != "true" ]; then
+            echo "Error crítico: no se pudo obtener respuesta de la API."
+            exit 1
+          fi
+
+          # Extraer el texto generado con jq
+          REVIEW_TEXT=$(jq -r '.candidates[0].content.parts[0].text // empty' gemini_response.json)
+
+          if [ -z "$REVIEW_TEXT" ]; then
+            echo "❌ La respuesta de Gemini no contiene candidatos de texto válidos."
+            cat gemini_response.json
+            exit 1
+          fi
+
+          # Encabezado dinámico según si es primera revisión o re-evaluación
+          TITLE="## 🤖 PuntoCroma AI Code Review"
+          if [ "$HAS_PREV" = "true" ]; then
+            TITLE="## 🤖 PuntoCroma AI Code Review (Re-evaluación)"
+          fi
+
+          # Generar archivo final de comentario Markdown
+          {
+            echo "$TITLE"
+            echo ""
+            echo "$REVIEW_TEXT"
+            echo ""
+            echo "---"
+            echo "_Revisión automatizada generada por PuntoCroma CI/CD usando \`$MODEL\`._"
+          } > review_comment.md
+
+      - name: Publicar Review en el PR
+        if: steps.get_diff.outputs.has_diff == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          echo "Publicando comentario en $PR_URL..."
+          gh pr comment "$PR_URL" --body-file review_comment.md
